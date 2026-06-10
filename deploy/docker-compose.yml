@@ -1,0 +1,60 @@
+version: "3.8"
+# FinSight Docker 部署配置
+# 注意: 请替换 ${YOUR_ENV_VARS} 为实际值
+
+services:
+  # 信息采集与 AI 分析
+  trendradar:
+    build: ./pipeline
+    container_name: trendradar
+    restart: always
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/output
+      - ./models:/app/models
+    env_file: .env
+    environment:
+      - SCHEDULED_PUSH=true
+      - TZ=Asia/Shanghai
+
+  # 投资决策后端
+  invest-backend:
+    build: ./services
+    container_name: invest-backend
+    ports:
+      - "5000:5000"
+    restart: always
+    volumes:
+      - ./data:/app/data
+    env_file: .env
+
+  # 统一通知中心
+  notification-center:
+    build: ./services
+    container_name: notification-center
+    ports:
+      - "5050:5050"
+    restart: always
+    volumes:
+      - ./data:/app/data
+    env_file: .env
+
+  # Web 仪表盘
+  dashboard:
+    build: ./services
+    container_name: dashboard
+    ports:
+      - "8085:5060"
+    restart: always
+
+  # 反馈学习
+  feedback-learner:
+    build: ./services
+    container_name: feedback-learner
+    restart: always
+    depends_on:
+      - invest-backend
+
+networks:
+  default:
+    name: finsight-net

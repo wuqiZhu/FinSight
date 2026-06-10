@@ -1,0 +1,23 @@
+# 数据
+*.db
+*.jsonl
+*.tar.gz
+data/
+
+# 模型
+models/*.onnx
+models/*.safetensors
+models/*.bin
+checkpoints/
+
+# 环境
+.env
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# 系统
+.DS_Store
+Thumbs.db
+*.log
