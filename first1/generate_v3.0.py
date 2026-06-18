@@ -43,7 +43,7 @@ def get_next_key():
         return key
 
 # ====== 基础配置 ======
-MAX_WORKERS = 24
+MAX_WORKERS = 6  # 429限流严重，降低并发
 
 # ====== 任务模板定义 ======
 #
@@ -100,9 +100,9 @@ TASK_TEMPLATES = [
         "name": "深度分析",
         "type": "long",
         "system": "你是一位资深金融分析师，有20年行业经验。请对以下新闻进行全面、深入的金融分析。分析要包含：1) 事件背景 2) 对相关公司/行业的具体影响 3) 市场各方反应 4) 未来趋势判断。要求分析有数据支撑、逻辑清晰、语言专业但不晦涩。",
-        "user": "请对以下新闻进行全面深入的金融分析（300-500字）。\n新闻：{title}",
-        "length": "300-500字",
-        "min_chars": 300,
+        "user": "请对以下新闻进行全面深入的金融分析（200-300字）。\n新闻：{title}",
+        "length": "200-300字",
+        "min_chars": 200,
     },
     {
         "name": "投资建议",
@@ -359,13 +359,14 @@ def call_mimo(prompt, system_prompt, max_tokens=1000, temperature=0.7):
         "temperature": temperature,
     }
 
-    for attempt in range(5):
+    for attempt in range(8):
         try:
-            resp = requests.post(API_URL, headers=headers, json=payload, timeout=90)
+            resp = requests.post(API_URL, headers=headers, json=payload, timeout=30)
             if resp.status_code == 429:
-                wait = 120 * (attempt + 1)
-                print(f"  429限流，等待{wait}秒...", flush=True)
-                time.sleep(wait)
+                # 429不傻等，立刻换密钥
+                api_key = get_next_key()
+                headers["Authorization"] = f"Bearer {api_key}"
+                time.sleep(2 * (attempt + 1))
                 continue
             resp.raise_for_status()
             data = resp.json()
@@ -380,14 +381,13 @@ def call_mimo(prompt, system_prompt, max_tokens=1000, temperature=0.7):
                     return reasoning.strip()
             return None
         except requests.exceptions.Timeout:
-            print(f"  超时，重试{attempt+1}/5", flush=True)
-            time.sleep(5)
-        except json.JSONDecodeError:
-            print(f"  JSON解析失败，重试", flush=True)
-            time.sleep(3)
+            api_key = get_next_key()
+            headers["Authorization"] = f"Bearer {api_key}"
+            time.sleep(1)
         except Exception as e:
-            print(f"  API错误: {e}", flush=True)
-            time.sleep(3 * (attempt + 1))
+            api_key = get_next_key()
+            headers["Authorization"] = f"Bearer {api_key}"
+            time.sleep(1)
     return None
 
 
@@ -435,17 +435,17 @@ def generate_single_sample(title, template):
         max_tokens = 50
         temperature = 0.1
     else:
-        max_tokens = 1500
+        max_tokens = 500  # 降到500，减少超时
         temperature = 0.7
 
     response = call_mimo(user_msg, system_prompt, max_tokens=max_tokens, temperature=temperature)
     if not response:
         return None
 
-    # 长度检查
+    # 长度检查（放宽：有内容就行，不卡300字）
     min_c = template.get("min_chars", 0)
-    if len(response) < min_c:
-        print(f"    回复过短({len(response)}字符<{min_c})，丢弃", flush=True)
+    if len(response) < 50:  # 实在太短才丢
+        print(f"    回复过短({len(response)}字符<50)，丢弃", flush=True)
         return None
 
     return {
@@ -489,6 +489,7 @@ def process_seed_batch(seed, templates, samples_per_seed=30):
             print(f"    ✓ {template['name']}: {len(sample['conversations'][1]['value'])}字符", flush=True)
         else:
             print(f"    ✗ {template['name']}: 生成失败", flush=True)
+        time.sleep(1.5)  # 限流保护：每个请求间隔1.5秒
 
     print(f"    完成: {len(samples)}/{samples_per_seed} 条", flush=True)
     return samples

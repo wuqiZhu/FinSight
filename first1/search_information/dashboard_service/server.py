@@ -373,6 +373,26 @@ def api_trend():
     return jsonify(result)
 
 
+@app.route('/search', methods=['GET'])
+def search_page():
+    """搜索页面"""
+    import os
+    html_path = os.path.join(os.path.dirname(__file__), 'templates', 'search.html')
+    if os.path.exists(html_path):
+        return open(html_path, encoding='utf-8').read()
+    return "搜索页面未找到", 404
+
+
+@app.route('/logs')
+def logs_page():
+    """日志中心页面"""
+    import os
+    html_path = os.path.join(os.path.dirname(__file__), 'templates', 'logs.html')
+    if os.path.exists(html_path):
+        return open(html_path, encoding='utf-8').read()
+    return "日志页面未找到", 404
+
+
 @app.route('/api/search')
 def api_search():
     """搜索新闻"""
@@ -397,6 +417,149 @@ def api_search():
             break
 
     return jsonify({"results": results[:limit], "total": len(results)})
+
+
+@app.route('/api/search/combined')
+def api_search_combined():
+    """多源搜索：新闻 + RSS + 分析库"""
+    query = request.args.get('q', '')
+    limit = int(request.args.get('limit', 30))
+    source = request.args.get('source', 'all')  # all, news, rss, analysis
+
+    if not query:
+        return jsonify({"results": [], "total": 0})
+
+    data_base = Path(os.environ.get("DATA_BASE", "/app/data"))
+    results = []
+
+    if source in ('all', 'news'):
+        news_dir = data_base / "search_information" / "news"
+        for db_file in sorted(news_dir.glob("*.db"), reverse=True)[:7]:
+            rows = query_db(
+                str(db_file),
+                "SELECT title, platform_id as source, url, created_at as date, '_source' as _type FROM news_items WHERE title LIKE ? LIMIT ?",
+                (f"%{query}%", limit)
+            )
+            for r in rows: r['_type'] = 'news'
+            results.extend(rows)
+
+    if source in ('all', 'rss'):
+        rss_dir = data_base / "search_information" / "rss"
+        for db_file in sorted(rss_dir.glob("*.db"), reverse=True)[:7]:
+            rows = query_db(
+                str(db_file),
+                "SELECT title, feed_name as source, link as url, published as created_at, '_source' as _type FROM rss_items WHERE title LIKE ? LIMIT ?",
+                (f"%{query}%", limit)
+            )
+            for r in rows:
+                if r.get('source'): r['_type'] = 'rss'
+            results.extend(rows)
+
+    if source in ('all', 'analysis'):
+        for db_path_candidate in [
+            str(data_base / "knowledge_base" / "analyzer.db"),
+            str(data_base / "knowledge_base" / "analyzed.db"),
+        ]:
+            rows = query_db(
+                db_path_candidate,
+                "SELECT title, source, url, created_at FROM processed_urls WHERE title LIKE ? LIMIT ?",
+                (f"%{query}%", limit)
+            )
+            for r in rows:
+                if r.get('title'): r['_type'] = 'analysis'
+            results.extend(rows)
+            if len(results) >= limit:
+                break
+
+    results.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+    return jsonify({"results": results[:limit], "total": len(results)})
+
+
+@app.route('/api/search/predictions')
+def api_search_predictions():
+    """搜索预测注册表（通过invest-backend代理）"""
+    query = request.args.get('q', '').strip()
+    invest_url = os.environ.get('INVEST_API_URL', 'http://invest-backend:5000')
+    try:
+        import requests
+        if query:
+            resp = requests.get(f"{invest_url}/api/predictions", params={"limit": 30}, timeout=10)
+            if resp.ok:
+                data = resp.json()
+                flags = data.get('flags', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                # 客户端过滤
+                ql = query.lower()
+                matched = [f for f in flags if ql in (f.get('content','') or '').lower()]
+                return jsonify({"predictions": matched, "total": len(matched)})
+        else:
+            resp = requests.get(f"{invest_url}/api/predictions", params={"limit": 20, "sort": "deadline", "dir": "ASC"}, timeout=10)
+            if resp.ok:
+                data = resp.json()
+                flags = data.get('flags', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                return jsonify({"predictions": flags, "total": len(flags)})
+    except Exception as e:
+        logger.warning(f"预测搜索代理失败: {e}")
+    return jsonify({"predictions": [], "total": 0})
+
+
+@app.route('/api/search/analyze', methods=['POST'])
+def api_search_analyze():
+    """AI解读搜索结果"""
+    data = request.get_json(silent=True)
+    query = (data or {}).get('query', '').strip()
+    results = (data or {}).get('results', [])
+
+    if not query:
+        return jsonify({"analysis": "", "error": "请输入查询关键词"}), 400
+
+    if not results:
+        return jsonify({"analysis": f"关于「{query}」没有找到相关资讯，无法生成分析。"})
+
+    # 准备上下文
+    snippets = []
+    for r in results[:8]:
+        title = r.get('title', '')
+        source = r.get('source', r.get('_type', '未知'))
+        snippets.append(f"- [{source}] {title}")
+    context = "\n".join(snippets)
+
+    try:
+        import urllib.request, json as _json
+        api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("MIMO_API_KEY", "")
+        api_base = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+        model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+
+        prompt = f"""你是一个金融资讯分析师。用户搜索了「{query}」，以下是相关的资讯标题列表：
+
+{context}
+
+请根据以上资讯，生成一份简洁的分析报告（200字以内）：
+1. 这些资讯主要围绕什么主题？
+2. 整体情绪偏向正面还是负面？
+3. 对投资者有什么值得关注的信号？"""
+
+        req_data = _json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 500,
+        }).encode()
+
+        req = urllib.request.Request(
+            f"{api_base}/chat/completions",
+            data=req_data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}"
+            }
+        )
+        resp = urllib.request.urlopen(req, timeout=30)
+        resp_data = _json.loads(resp.read().decode())
+        analysis = resp_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+        return jsonify({"analysis": analysis, "query": query})
+    except Exception as e:
+        logger.warning(f"AI解读生成失败: {e}")
+        return jsonify({"analysis": "", "error": f"AI解读暂时不可用: {str(e)[:50]}"})
 
 
 @app.route('/api/semantic-search', methods=['POST'])
@@ -480,9 +643,93 @@ def api_market_sentiment():
         return jsonify({'error': f'市场情绪服务不可用: {str(e)}'}), 503
 
 
+@app.route('/api/learning-stats')
+def api_learning_stats():
+    """反馈学习统计"""
+    data_base = Path(os.environ.get("DATA_BASE", "/app/data"))
+    knowledge_file = data_base / "invest" / "knowledge" / "lessons.json"
+    stats = {"lessons": 0, "patterns": 0, "rules": 0, "recent_lessons": []}
+    try:
+        if knowledge_file.exists():
+            import json as _json
+            with open(knowledge_file) as f:
+                d = _json.load(f)
+            stats["lessons"] = len(d.get("lessons", []))
+            stats["patterns"] = len(d.get("patterns", []))
+            stats["rules"] = len(d.get("rules", []))
+            stats["recent_lessons"] = d.get("lessons", [])[-3:]
+            for l in stats["recent_lessons"]:
+                l["content"] = l.get("content", "")[:80]
+        else:
+            # fallback: 从invest-backend读
+            import requests
+            resp = requests.get("http://invest-backend:5000/api/knowledge/stats", timeout=5)
+            if resp.ok:
+                stats.update(resp.json())
+    except Exception as e:
+        logger.warning(f"反馈学习统计不可用: {e}")
+    return jsonify(stats)
+
+
+@app.route('/api/prediction-summary')
+def api_prediction_summary():
+    """预测注册表概览（通过invest-backend代理）"""
+    invest_url = os.environ.get('INVEST_API_URL', 'http://invest-backend:5000')
+    try:
+        import requests
+        resp = requests.get(f"{invest_url}/api/predictions/stats", timeout=10)
+        if resp.ok:
+            return jsonify(resp.json())
+    except Exception as e:
+        logger.warning(f"预测统计代理失败: {e}")
+    # fallback: 尝试直接读DB
+    summary = {"total": 0, "pending": 0, "confirmed": 0, "rejected": 0, "accuracy": 0}
+    for p in [Path(os.environ.get("DATA_BASE", "/app/data")) / "invest" / "prediction_registry" / "predictions.db",
+              Path("/root/projects/data/invest/prediction_registry/predictions.db")]:
+        if p.exists():
+            try:
+                import sqlite3
+                conn = sqlite3.connect(str(p))
+                summary["total"] = conn.execute("SELECT COUNT(*) FROM flags").fetchone()[0]
+                rows = conn.execute("SELECT status, COUNT(*) as c FROM flags GROUP BY status").fetchall()
+                for s, c in rows:
+                    if s in summary: summary[s] = c
+                conf = conn.execute("SELECT COUNT(*) FROM flags WHERE status='confirmed'").fetchone()[0]
+                rej = conn.execute("SELECT COUNT(*) FROM flags WHERE status='rejected'").fetchone()[0]
+                tv = conf + rej
+                summary["accuracy"] = round(conf / tv * 100, 1) if tv else 0
+                conn.close()
+                break
+            except: pass
+    return jsonify(summary)
+
+
+@app.route('/api/recent-analyses')
+def api_recent_analyses():
+    """最近AI分析结果（从知识库读取）"""
+    data_base = Path(os.environ.get("DATA_BASE", "/app/data"))
+    results = []
+    for db_name in ["analyzer.db", "analyzed.db"]:
+        db_path = data_base / "knowledge_base" / db_name
+        if db_path.exists():
+            try:
+                rows = query_db(
+                    str(db_path),
+                    "SELECT title, summary, source, created_at, sentiment_score, url, analysis FROM processed_urls WHERE analysis IS NOT NULL AND analysis != '' ORDER BY created_at DESC LIMIT 15"
+                )
+                for r in rows:
+                    r['_type'] = 'analysis'
+                    if r.get('analysis') and len(r['analysis']) > 200:
+                        r['analysis'] = r['analysis'][:200] + '...'
+                results.extend(rows)
+            except Exception as e:
+                logger.warning(f"查询{db_name}失败: {e}")
+    return jsonify({"analyses": results[:15], "total": len(results)})
+
+
 @app.route('/api/portfolio')
 def api_portfolio():
-    """代理转发持仓数据API"""
+    """日志API"""
     invest_url = os.environ.get('INVEST_API_URL', 'http://invest-backend:5000')
     try:
         import requests
@@ -622,12 +869,69 @@ def api_delete_fund(code):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/logs')
+def api_logs():
+    """获取各容器最近日志（Docker SDK）"""
+    import json as _json
+    lines = int(request.args.get('lines', 15))
+    containers = request.args.get('containers', '').split(',')
+
+    all_names = ['trendradar', 'dashboard', 'invest-backend', 'notification-center',
+                 'semantic-search', 'analyser', 'feedback-learner']
+    targets = [c for c in all_names if not containers[0] or any(t in c for t in containers)]
+
+    result = {}
+    try:
+        import docker
+        client = docker.from_env()
+        for container in client.containers.list(all=True):
+            name = container.name
+            if name in targets:
+                try:
+                    logs = container.logs(tail=lines, timestamps=True).decode('utf-8', errors='replace')
+                    lines_out = [l for l in logs.split('\n') if l.strip()]
+                    result[name] = lines_out[-lines:] if lines_out else ['(no logs)']
+                except Exception as e:
+                    result[name] = [f'(error: {e})']
+    except Exception as e:
+        return _json.dumps({"error": str(e), "logs": {}}, ensure_ascii=False)
+    return _json.dumps({"logs": result, "containers": targets}, ensure_ascii=False)
+
+
+@app.route('/api/logs/search')
+def api_logs_search():
+    """搜索所有容器日志（Docker SDK）"""
+    import json as _json
+    q = request.args.get('q', '').strip()
+    lines = int(request.args.get('lines', 50))
+    if not q:
+        return _json.dumps({"error": "缺少查询关键词"}), 400
+
+    result = {}
+    try:
+        import docker
+        client = docker.from_env()
+        for container in client.containers.list(all=True):
+            if container.name in ['trendradar','dashboard','invest-backend','notification-center',
+                                  'semantic-search','analyser','feedback-learner']:
+                try:
+                    logs = container.logs(tail=lines).decode('utf-8', errors='replace')
+                    matched = [l for l in logs.split('\n') if q.lower() in l.lower()]
+                    if matched:
+                        result[container.name] = matched[:15]
+                except:
+                    pass
+    except Exception as e:
+        return _json.dumps({"error": str(e), "logs": {}}, ensure_ascii=False)
+    return _json.dumps({"logs": result, "query": q}, ensure_ascii=False)
+
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>投资情报系统</title>
+    <title>百器模型 · 投资情报系统</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f1a; color: #e0e0e0; }
@@ -777,6 +1081,45 @@ async function loadPortal() {
         for (let k in db) { dbHTML += `<div class="row"><span>${k}</span><span>${db[k]}</span></div>`; }
         cardDB.innerHTML = dbHTML || '暂无数据';
 
+        // 反馈学习统计
+        try {
+            const lr = await (await fetch('/api/learning-stats')).json();
+            const lc = document.getElementById('learningContent');
+            if (lr.lessons != null) {
+                lc.innerHTML = `
+                    <div style="display:flex;gap:20px;margin-bottom:10px">
+                        <div><b>📝 ${lr.lessons}</b> 条经验</div>
+                        <div><b>🔄 ${lr.patterns}</b> 个模式</div>
+                        <div><b>⚙️ ${lr.rules}</b> 条规则</div>
+                    </div>
+                    ${(lr.recent_lessons||[]).slice(-2).map(l =>
+                        `<div style="font-size:13px;color:#666;border-left:3px solid #4A6CF7;padding:4px 10px;margin:4px 0">${l.content||''}</div>`
+                    ).join('')}
+                `;
+            }
+        } catch(e) { console.log('学习统计加载失败:', e); }
+
+        // 预测统计
+        try {
+            const pr = await (await fetch('/api/prediction-summary')).json();
+            const pc = document.getElementById('predictionContent');
+            if (pr.total != null) {
+                const barW = pr.total > 0 ? (pr.total - pr.pending) / pr.total * 100 : 0;
+                pc.innerHTML = `
+                    <div style="display:flex;gap:20px;margin-bottom:10px">
+                        <div><b>🏁 ${pr.total}</b> 面旗</div>
+                        <div><b>⏳ ${pr.pending}</b> 待验证</div>
+                        <div><b>✅ ${pr.confirmed}</b> 确认 ✓</div>
+                        <div><b>❌ ${pr.rejected}</b> 拒绝 ✗</div>
+                        <div><b>🎯 ${pr.accuracy}%</b> 准确率</div>
+                    </div>
+                    <div style="height:8px;background:#e8e8e8;border-radius:4px;overflow:hidden;margin-top:6px">
+                        <div style="height:100%;width:${barW}%;background:linear-gradient(90deg,#4A6CF7,#00c853);border-radius:4px"></div>
+                    </div>
+                `;
+            }
+        } catch(e) { console.log('预测统计加载失败:', e); }
+
         // 新闻数据卡片
         let nd = d.news_db || {};
         let cardNews = document.getElementById('cardNews');
@@ -821,7 +1164,7 @@ loadPortal();
 setInterval(loadPortal, 30000);
 </script>
 </body>
-</html>"""
+</html>
         .badge-source { background: #eef; color: #006; }
         .empty { text-align: center; padding: 40px; color: #999; }
         .refresh-btn { background: #1a1a2e; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; }
@@ -877,6 +1220,20 @@ setInterval(loadPortal, 30000);
         <div class="section">
             <h2>数据趋势（最近7天）</h2>
             <canvas id="trendChart" height="200"></canvas>
+        </div>
+
+        <div class="section" id="sectionLearning">
+            <h2>📝 反馈学习</h2>
+            <div id="learningContent" style="font-size:14px;line-height:1.8;color:#555">
+                <div class="empty">加载中...</div>
+            </div>
+        </div>
+
+        <div class="section" id="sectionPredictions">
+            <h2>🔮 预测注册表</h2>
+            <div id="predictionContent" style="font-size:14px;line-height:1.8;color:#555">
+                <div class="empty">加载中...</div>
+            </div>
         </div>
 
         <div class="section">
@@ -1085,16 +1442,20 @@ setInterval(loadPortal, 30000);
 
             try {
                 const resp = await fetch(`/api/search?q=${encodeURIComponent(query)}&limit=20`);
-                const data = await resp.json();
+                const raw = await resp.json();
+                const results = (Array.isArray(raw) ? raw
+                              : Array.isArray(raw.results) ? raw.results
+                              : Array.isArray(raw.data) ? raw.data
+                              : []);
                 const el = document.getElementById('search-results');
 
-                if (data.results.length === 0) {
+                if (results.length === 0) {
                     el.innerHTML = `<div class="empty">未找到包含"${query}"的新闻</div>`;
                     return;
                 }
 
-                el.innerHTML = `<div class="item"><div class="item-title">找到 ${data.total} 条结果</div></div>` +
-                    data.results.map(item =>
+                el.innerHTML = `<div class="item"><div class="item-title">找到 ${results.length} 条结果</div></div>` +
+                    results.map(item =>
                         `<div class="item"><div class="item-title">${item.url ? `<a href="${item.url}" target="_blank" rel="noopener">${item.title}</a>` : item.title}</div><div class="item-meta"><span class="badge badge-source">${item.source}</span> ${item.date}</div></div>`
                     ).join('');
             } catch (e) {
@@ -1548,7 +1909,10 @@ setInterval(loadPortal, 30000);
 
 @app.route('/')
 def dashboard():
-    """Dashboard 主页"""
+    """Dashboard 主页（优先加载模板文件，fallback到内嵌HTML）"""
+    html_path = os.path.join(os.path.dirname(__file__), 'templates', 'dashboard.html')
+    if os.path.exists(html_path):
+        return open(html_path, encoding='utf-8').read()
     return DASHBOARD_HTML
 
 
