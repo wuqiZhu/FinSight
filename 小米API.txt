@@ -1,8 +1,0 @@
-https://token-plan-cn.xiaomimimo.com/v1
-
-mimo-v2.5-pro
-
-小米密钥（上一个）：
-tp-c88mqn84f8gnc1lusitqoljkvgvhmc8sy5hosyswlv0r6t0b
-小米密钥（目前）
-tp-ctqvi4hm4s81gys5f9mua8q9jmw6dp4iimm9o7imoa78c6mi
